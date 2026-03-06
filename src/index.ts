@@ -1,9 +1,16 @@
 import { config } from './config';
 import { logger } from './logger';
 import { initDb } from './db';
+import { InputController, FrameSource } from './types';
 import { EmulatorInput } from './drivers/emulator-input';
 import { EmulatorFrames } from './drivers/emulator-frames';
+import { SwitchInput } from './drivers/switch-input';
+import { CaptureCardFrames } from './drivers/capture-card-frames';
 import { HuntEngine } from './engine/hunt-engine';
+import { RngEngine } from './engine/rng-engine';
+import { SwitchRngEngine } from './engine/rng-switch';
+import { WildHuntEngine } from './engine/wild-hunt';
+import { StaticHuntEngine } from './engine/static-hunt';
 import { startServer } from './server';
 import {
   createHunt,
@@ -16,31 +23,78 @@ import {
   notifyMilestone,
   notifyHuntStarted,
   notifyHuntStopped,
+  notifyDailySummary,
 } from './services/discord';
 
 async function main() {
   logger.info('=== Shiny Hunter starting ===');
-  logger.info(`Target: ${config.hunt.target} | Game: ${config.hunt.game}`);
+  logger.info(`Target: ${config.hunt.target} | Game: ${config.hunt.game} | Env: ${config.env} | Type: ${config.hunt.huntType}`);
 
   // Init database
   initDb();
 
-  // Init drivers
-  const input = new EmulatorInput();
-  const frames = new EmulatorFrames(input);
+  // Init drivers based on environment
+  let input: InputController;
+  let frames: FrameSource;
 
-  try {
-    await input.init();
-    await frames.init();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.error(`Failed to connect to mGBA: ${msg}`);
-    logger.info('Make sure mGBA is running with lua/bridge.lua loaded.');
-    logger.info('Starting server without hunt capability...');
+  if (config.env === 'switch') {
+    logger.info('Environment: Switch hardware (ESP32 serial + capture card)');
+    const switchInput = new SwitchInput();
+    const captureFrames = new CaptureCardFrames();
+    input = switchInput;
+    frames = captureFrames;
+
+    try {
+      await switchInput.init();
+      await captureFrames.init();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`Failed to init Switch drivers: ${msg}`);
+      logger.info('Check SWITCH_SERIAL_PORT and CAPTURE_DEVICE in .env');
+      logger.info('Starting server without hunt capability...');
+    }
+  } else {
+    logger.info('Environment: Emulator (mGBA Lua bridge)');
+    const emuInput = new EmulatorInput();
+    const emuFrames = new EmulatorFrames(emuInput);
+    input = emuInput;
+    frames = emuFrames;
+
+    try {
+      await emuInput.init();
+      await emuFrames.init();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`Failed to connect to mGBA: ${msg}`);
+      logger.info('Make sure mGBA is running with lua/bridge.lua loaded.');
+      logger.info('Starting server without hunt capability...');
+    }
   }
 
-  // Create hunt engine
-  const engine = new HuntEngine(frames, input);
+  // Create hunt engine based on mode + environment + hunt type
+  let engine: HuntEngine | RngEngine | SwitchRngEngine | WildHuntEngine | StaticHuntEngine;
+
+  if (config.hunt.huntType === 'wild') {
+    logger.info(`Mode: Wild encounter hunting (${config.hunt.target} in ${config.hunt.game})`);
+    engine = new WildHuntEngine(frames, input);
+  } else if (config.hunt.huntType === 'static') {
+    logger.info(`Mode: Static encounter hunting (${config.hunt.target} in ${config.hunt.game})`);
+    engine = new StaticHuntEngine(frames, input);
+  } else if (config.hunt.mode === 'rng') {
+    if (config.env === 'switch') {
+      throw new Error('RNG mode requires emulator (memory reads). Use hunt mode "reset" or "switch-rng" for Switch hardware.');
+    }
+    logger.info('Mode: RNG manipulation (emulator — memory reads)');
+    const rng = new RngEngine(frames, input as EmulatorInput);
+    if (config.hunt.targetNature) rng.setTargetNature(config.hunt.targetNature);
+    engine = rng;
+  } else if (config.hunt.mode === 'switch-rng') {
+    logger.info('Mode: Switch RNG (blind timing — no memory reads)');
+    engine = new SwitchRngEngine(frames, input);
+  } else {
+    logger.info('Mode: Soft reset hunting');
+    engine = new HuntEngine(frames, input);
+  }
 
   // Track active hunt in DB
   let currentHuntId: number | null = null;
@@ -92,13 +146,88 @@ async function main() {
     }
   }, 10000);
 
-  // Start Express server
-  startServer(engine);
+  // Daily Discord summary — tracks encounters per day
+  let dailyEncounters = 0;
+  let dailyShinies = 0;
+  let dailyActiveSeconds = 0;
+  let dailyLastCheck = Date.now();
+
+  // Update daily counters on each encounter check
+  engine.on('milestone', () => {
+    // milestone fires every 500, but we track continuously via the status
+  });
+
+  const dailyTracker = setInterval(() => {
+    if (engine.getStatus().running) {
+      const now = Date.now();
+      dailyActiveSeconds += (now - dailyLastCheck) / 1000;
+      dailyLastCheck = now;
+    } else {
+      dailyLastCheck = Date.now();
+    }
+  }, 60000); // update active time every minute
+
+  // Send daily summary every 24 hours
+  const dailySummaryInterval = setInterval(async () => {
+    const status = engine.getStatus();
+    const todayEncounters = status.running
+      ? status.encounters - (lastSavedEncounters - dailyEncounters) + dailyEncounters
+      : dailyEncounters;
+
+    // Use actual encounter count from status for accuracy
+    const activeHours = dailyActiveSeconds / 3600;
+    const avgRate = activeHours > 0 ? Math.round(dailyEncounters / activeHours) : 0;
+
+    if (dailyEncounters > 0) {
+      await notifyDailySummary({
+        encounters: dailyEncounters,
+        shinies: dailyShinies,
+        hoursActive: activeHours,
+        avgRate,
+        target: config.hunt.target,
+        game: config.hunt.game,
+      });
+    }
+
+    // Reset daily counters
+    dailyEncounters = 0;
+    dailyShinies = 0;
+    dailyActiveSeconds = 0;
+    dailyLastCheck = Date.now();
+  }, 24 * 60 * 60 * 1000); // every 24 hours
+
+  // Track daily encounters from the engine's encounter event
+  let lastKnownEncounters = 0;
+  const encounterTracker = setInterval(() => {
+    if (engine.getStatus().running) {
+      const current = engine.getStatus().encounters;
+      if (current > lastKnownEncounters) {
+        dailyEncounters += current - lastKnownEncounters;
+        lastKnownEncounters = current;
+      }
+    }
+  }, 5000); // check every 5 seconds
+
+  // Reset lastKnownEncounters when a new hunt starts
+  engine.on('started', () => {
+    lastKnownEncounters = 0;
+    dailyLastCheck = Date.now();
+  });
+
+  engine.on('shiny', () => {
+    dailyShinies++;
+  });
+
+  // Start Express server (pass frame source for live view)
+  startServer(engine, frames);
 
   // Graceful shutdown
   const shutdown = async () => {
     logger.info('Shutting down...');
     clearInterval(saveInterval);
+    clearInterval(dailyTracker);
+    clearInterval(dailySummaryInterval);
+    clearInterval(encounterTracker);
     engine.stop();
     await input.cleanup();
     await frames.cleanup();

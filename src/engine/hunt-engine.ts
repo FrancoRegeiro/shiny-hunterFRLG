@@ -1,12 +1,13 @@
 import { EventEmitter } from 'events';
 import path from 'path';
 import fs from 'fs/promises';
-import { HuntState, HuntStatus, FrameSource, InputController, ButtonSequence, SequenceStep, GBAButton } from '../types';
+import { HuntState, HuntStatus, FrameSource, InputController, ButtonSequence, SequenceStep } from '../types';
 import { config } from '../config';
 import { logger } from '../logger';
 import { detectShiny } from '../detection/shiny-detector';
-import { detectScreen } from '../detection/screen-detector';
+import { extractSummaryInfo } from '../detection/summary-info';
 import { getSequences } from './sequences';
+import { exitSummaryAndSave } from './save-game';
 
 export class HuntEngine extends EventEmitter {
   private state: HuntState = 'IDLE';
@@ -17,7 +18,6 @@ export class HuntEngine extends EventEmitter {
   private input: InputController;
   private target: string;
   private game: string;
-  private saveSlot: number;
 
   constructor(frameSource: FrameSource, input: InputController) {
     super();
@@ -25,7 +25,6 @@ export class HuntEngine extends EventEmitter {
     this.input = input;
     this.target = config.hunt.target;
     this.game = config.hunt.game;
-    this.saveSlot = config.hunt.saveStateSlot;
   }
 
   getStatus(): HuntStatus {
@@ -55,24 +54,17 @@ export class HuntEngine extends EventEmitter {
     this.running = true;
     this.encounters = 0;
     this.startedAt = Date.now();
-    this.state = 'LOAD_STATE';
+    this.state = 'SOFT_RESET';
 
     this.emit('started', this.getStatus());
 
-    // Enable turbo if configured
-    if (config.hunt.turboEnabled) {
-      await this.input.setTurbo(true);
-    }
-
-    // Main loop
     while (this.running) {
       try {
         await this.tick();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(`Hunt engine error in state ${this.state}: ${msg}`);
-        // On error, try to reset and continue
-        this.state = 'LOAD_STATE';
+        this.state = 'SOFT_RESET';
         await this.wait(1000);
       }
     }
@@ -87,26 +79,54 @@ export class HuntEngine extends EventEmitter {
 
   private async tick(): Promise<void> {
     switch (this.state) {
-      case 'LOAD_STATE':
-        await this.doLoadState();
+      case 'SOFT_RESET':
+        await this.input.softReset();
+        this.state = 'WAIT_BOOT';
         break;
-      case 'WAIT_SETTLE':
-        await this.doWaitSettle();
+      case 'WAIT_BOOT':
+        // GBA BIOS ~1.5s + Game Freak logo ~3s = 4.5s (unskippable)
+        // Random 0-500ms varies RNG frame count for different Pokemon
+        await this.wait(4500 + Math.floor(Math.random() * 500));
+        this.state = 'TITLE_SCREEN';
+        break;
+      case 'TITLE_SCREEN':
+        await this.executeSequence(getSequences(this.game, this.target).title);
+        this.state = 'LOAD_SAVE';
+        break;
+      case 'LOAD_SAVE':
+        await this.executeSequence(getSequences(this.game, this.target).loadSave);
+        this.state = 'WAIT_OVERWORLD';
+        break;
+      case 'WAIT_OVERWORLD':
+        // "Previously on your quest..." recap — varies in length, mash enough A presses
+        for (let i = 0; i < 8; i++) {
+          if (!this.running) return;
+          await this.input.pressButton('A', 50);
+          await this.wait(250);
+        }
+        await this.wait(400);
+        this.state = 'PICK_STARTER';
         break;
       case 'PICK_STARTER':
-        await this.doPickStarter();
+        await this.executeSequence(getSequences(this.game, this.target).pick);
+        this.state = 'OPEN_SUMMARY';
         break;
-      case 'OPEN_PARTY':
-        await this.doOpenParty();
+      case 'OPEN_SUMMARY':
+        await this.executeSequence(getSequences(this.game, this.target).summary);
+        await this.wait(300);
+        this.state = 'CAPTURE_AND_DETECT';
         break;
       case 'CAPTURE_AND_DETECT':
         await this.doCaptureAndDetect();
         break;
       case 'SHINY_FOUND':
-        await this.doShinyFound();
+        logger.info('Shiny found! Exiting summary and saving game...');
+        await exitSummaryAndSave(this.input);
+        logger.info('Game saved with shiny! Stopping hunt — DO NOT RESET.');
+        this.stop();
         break;
       case 'RESET':
-        this.state = 'LOAD_STATE';
+        this.state = 'SOFT_RESET';
         break;
       case 'IDLE':
         await this.wait(100);
@@ -114,90 +134,83 @@ export class HuntEngine extends EventEmitter {
     }
   }
 
-  private async doLoadState(): Promise<void> {
-    await this.input.loadState(this.saveSlot);
-    this.state = 'WAIT_SETTLE';
-  }
-
-  private async doWaitSettle(): Promise<void> {
-    await this.wait(500);
-    this.state = 'PICK_STARTER';
-  }
-
-  private async doPickStarter(): Promise<void> {
-    const seqs = getSequences(this.game, this.target);
-    await this.executeSequence(seqs.pick);
-    this.state = 'OPEN_PARTY';
-  }
-
-  private async doOpenParty(): Promise<void> {
-    const seqs = getSequences(this.game, this.target);
-    await this.executeSequence(seqs.summary);
-    // Wait a moment for the summary screen to fully render
-    await this.wait(300);
-    this.state = 'CAPTURE_AND_DETECT';
-  }
-
   private async doCaptureAndDetect(): Promise<void> {
     this.encounters++;
 
-    // Capture the frame
-    const frame = await this.frameSource.captureFrame();
+    // Try up to 3 times to land on the summary screen
+    let frame: Buffer | null = null;
+    let result = await this.captureAndDetectOnce();
 
-    // Verify we're on the summary screen
-    const screen = await detectScreen(frame);
-    if (screen.screen !== 'summary' && screen.confidence > 0.6) {
-      logger.warn(`Expected summary screen, got: ${screen.screen} (conf: ${screen.confidence})`);
-      // Try waiting and re-capturing
-      await this.wait(500);
-      const retryFrame = await this.frameSource.captureFrame();
-      const retryScreen = await detectScreen(retryFrame);
-      if (retryScreen.screen !== 'summary') {
-        logger.warn(`Still not on summary screen after retry. Resetting.`);
-        this.state = 'RESET';
-        return;
+    if (!result.detected) {
+      // Save debug frame to see what screen we're on
+      try {
+        const debugPath = path.join(process.cwd(), config.paths.screenshots, `debug-miss-e${this.encounters}.png`);
+        await fs.writeFile(debugPath, result.frame);
+        logger.info(`Saved debug frame: ${debugPath}`);
+      } catch { /* ignore */ }
+
+      // Not on summary — try pressing B to exit wrong screen, then A to re-navigate
+      for (let retry = 0; retry < 4 && this.running; retry++) {
+        logger.info(`Retry ${retry + 1}: not on summary screen, pressing B...`);
+        await this.input.pressButton('B', 50);
+        await this.wait(400);
+        result = await this.captureAndDetectOnce();
+        if (result.detected) {
+          logger.info(`Retry ${retry + 1}: found summary screen!`);
+          break;
+        }
       }
-      // Use the retry frame for detection
-      return this.runDetection(retryFrame);
     }
 
-    await this.runDetection(frame);
-  }
+    frame = result.frame;
+    const detection = result.result;
 
-  private async runDetection(frame: Buffer): Promise<void> {
-    const result = await detectShiny(frame, this.target, this.game);
+    // Extract nature and gender from summary screen
+    let natureGender = '';
+    if (detection.debugInfo !== 'not on summary screen') {
+      try {
+        const summaryInfo = await extractSummaryInfo(frame!);
+        const genderStr = summaryInfo.gender === 'male' ? '♂' : summaryInfo.gender === 'female' ? '♀' : '?';
+        natureGender = ` | ${summaryInfo.nature ?? 'nature?'} ${genderStr}`;
+      } catch { /* OCR failure is non-critical */ }
+    }
 
-    if (result.isShiny) {
+    // Log encounter to Lua bridge log
+    this.input.logEncounter?.(this.encounters, detection.isShiny, this.target, (detection.debugInfo ?? '') + natureGender);
+
+    // False positive guard: too few pixels = wrong screen
+    if (detection.isShiny && detection.totalSampled < 50) {
+      logger.warn(`False positive — ${detection.totalSampled} pixels, wrong screen. Resetting.`);
+      this.state = 'RESET';
+      return;
+    }
+
+    const status = this.getStatus();
+    logger.info(
+      `[Encounter #${this.encounters}] ${detection.isShiny ? 'SHINY!' : 'normal'} | ` +
+      `${status.encountersPerHour}/hr | ${detection.debugInfo}${natureGender}`
+    );
+
+    if (detection.isShiny) {
       logger.info(`*** SHINY ${this.target.toUpperCase()} FOUND! *** Encounter #${this.encounters}`);
-      logger.info(`Detection: ${result.debugInfo}`);
+      logger.info(`Detection: ${detection.debugInfo}`);
 
-      // Save screenshot
       const screenshotPath = path.join(
-        process.cwd(),
-        config.paths.screenshots,
+        process.cwd(), config.paths.screenshots,
         `shiny-${this.target}-${Date.now()}.png`
       );
-      await fs.writeFile(screenshotPath, frame);
+      await fs.writeFile(screenshotPath, frame!);
 
       this.emit('shiny', {
         pokemon: this.target,
         encounters: this.encounters,
         elapsedSeconds: this.startedAt ? (Date.now() - this.startedAt) / 1000 : 0,
         screenshotPath,
-        detection: result,
+        detection,
       });
 
       this.state = 'SHINY_FOUND';
     } else {
-      // Log progress periodically
-      if (this.encounters % 10 === 0) {
-        const status = this.getStatus();
-        logger.info(
-          `Encounter #${this.encounters} — ${status.encountersPerHour}/hr — ${result.debugInfo}`
-        );
-      }
-
-      // Emit milestone events
       if (this.encounters % config.hunt.milestoneInterval === 0) {
         this.emit('milestone', this.getStatus());
       }
@@ -206,13 +219,15 @@ export class HuntEngine extends EventEmitter {
     }
   }
 
-  private async doShinyFound(): Promise<void> {
-    // Disable turbo
-    await this.input.setTurbo(false);
-    // Save state in a different slot so we don't overwrite
-    await this.input.saveState(this.saveSlot + 1);
-    logger.info(`Shiny saved to state slot ${this.saveSlot + 1}`);
-    this.stop();
+  private async captureAndDetectOnce(): Promise<{
+    detected: boolean;
+    frame: Buffer;
+    result: Awaited<ReturnType<typeof detectShiny>>;
+  }> {
+    const frame = await this.frameSource.captureFrame();
+    const result = await detectShiny(frame, this.target, this.game);
+    const detected = result.debugInfo !== 'not on summary screen';
+    return { detected, frame, result };
   }
 
   private async executeSequence(sequence: ButtonSequence): Promise<void> {
@@ -227,25 +242,29 @@ export class HuntEngine extends EventEmitter {
       case 'press':
         await this.input.pressButtons(step.keys, step.holdMs);
         break;
-
       case 'wait':
         await this.wait(step.ms);
         break;
-
       case 'mashA':
         for (let i = 0; i < step.count && this.running; i++) {
           await this.input.pressButton('A', 50);
           await this.wait(step.intervalMs);
         }
         break;
-
       case 'mashB':
         for (let i = 0; i < step.count && this.running; i++) {
           await this.input.pressButton('B', 50);
           await this.wait(step.intervalMs);
         }
         break;
+      case 'screenshot':
+        await this.debugScreenshot(step.label);
+        break;
     }
+  }
+
+  private async debugScreenshot(_phase: string): Promise<void> {
+    // Disabled for production
   }
 
   private wait(ms: number): Promise<void> {

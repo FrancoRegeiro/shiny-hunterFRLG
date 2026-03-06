@@ -19,11 +19,8 @@ export class EmulatorFrames implements FrameSource {
   async captureFrame(): Promise<Buffer> {
     const framePath = config.paths.tmpFrame;
 
-    // Ask mGBA to write a screenshot
+    // Ask mGBA to write a screenshot (synchronous on Lua side — file is ready when we get the response)
     await this.input.captureScreenshot(framePath);
-
-    // Small delay to ensure file is written
-    await new Promise((r) => setTimeout(r, 30));
 
     // Read the PNG file
     const buffer = await fs.readFile(framePath);

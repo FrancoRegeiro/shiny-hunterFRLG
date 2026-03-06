@@ -2,7 +2,6 @@ import sharp from 'sharp';
 import { DetectionResult, SpriteRegion, ColorSignature, HueRange } from '../types';
 import { getPalette } from './color-palettes';
 import { getSummarySpriteRegion } from './sprite-regions';
-import { logger } from '../logger';
 
 // Convert RGB to HSL
 function rgbToHsl(r: number, g: number, b: number): { h: number; s: number; l: number } {
@@ -40,7 +39,6 @@ function hueInRange(hue: number, range: HueRange): boolean {
   if (range.min <= range.max) {
     return hue >= range.min && hue <= range.max;
   }
-  // Wrapping range (e.g., 350-10 for red)
   return hue >= range.min || hue <= range.max;
 }
 
@@ -49,92 +47,201 @@ function matchesSignature(h: number, s: number, l: number, sig: ColorSignature):
   return sig.hueRanges.some((range) => hueInRange(h, range));
 }
 
+interface RawImageInfo {
+  width: number;
+  height: number;
+  channels: number;
+}
+
 export async function detectShiny(
   frameBuffer: Buffer,
   pokemon: string,
   game: string
 ): Promise<DetectionResult> {
-  const palette = getPalette(pokemon);
-  if (!palette) {
+  const { data: rawData, info } = await sharp(frameBuffer).raw().toBuffer({ resolveWithObject: true });
+
+  const onSummary = isSummaryScreenFromRaw(rawData, info);
+  if (!onSummary) {
     return {
       isShiny: false,
       confidence: 0,
       normalPixels: 0,
       shinyPixels: 0,
       totalSampled: 0,
-      debugInfo: `No palette defined for ${pokemon}`,
+      debugInfo: 'not on summary screen',
     };
   }
 
+  // PRIMARY METHOD: Check UI border color around Pokemon name
+  // In FRLG, this border is purple/lavender for normal, teal/blue for shiny
+  const borderResult = detectShinyByBorder(rawData, info);
+
+  // SECONDARY METHOD: Sprite color analysis (palette-based)
+  const palette = getPalette(pokemon);
   const region = getSummarySpriteRegion(game);
-  return analyzeRegion(frameBuffer, region, palette);
+  const spriteResult = palette
+    ? analyzeRegionFromRaw(rawData, info, region, palette)
+    : null;
+
+  // Combine: border detection is the primary signal
+  const isShiny = borderResult.isShiny;
+  const totalSampled = spriteResult ? spriteResult.totalSampled : borderResult.borderPixelsSampled;
+
+  const debugParts = [
+    `border=${borderResult.isShiny ? 'SHINY(teal)' : 'normal(purple)'}`,
+    `teal=${borderResult.tealPixels} purple=${borderResult.purplePixels}`,
+  ];
+  if (spriteResult) {
+    debugParts.push(`sprite: normal=${spriteResult.normalPixels} shiny=${spriteResult.shinyPixels} total=${spriteResult.totalSampled}`);
+  }
+
+  return {
+    isShiny,
+    confidence: borderResult.confidence,
+    normalPixels: spriteResult?.normalPixels ?? borderResult.purplePixels,
+    shinyPixels: spriteResult?.shinyPixels ?? borderResult.tealPixels,
+    totalSampled,
+    debugInfo: debugParts.join(' | '),
+  };
 }
 
-async function analyzeRegion(
-  frameBuffer: Buffer,
+// FRLG summary screen border detection
+// The UI panel/border around the Pokemon name area changes color:
+// - Normal Pokemon: purple/lavender (hue ~270°, sat > 0.2)
+// - Shiny Pokemon: teal/cyan-blue (hue ~160-200°, sat > 0.2)
+// Sample multiple points in the border region for robustness
+interface BorderResult {
+  isShiny: boolean;
+  confidence: number;
+  tealPixels: number;
+  purplePixels: number;
+  borderPixelsSampled: number;
+}
+
+function detectShinyByBorder(data: Buffer, info: RawImageInfo): BorderResult {
+  const getPixel = (px: number, py: number) => {
+    const cx = Math.min(px, info.width - 1);
+    const cy = Math.min(py, info.height - 1);
+    const idx = (cy * info.width + cx) * info.channels;
+    return { r: data[idx], g: data[idx + 1], b: data[idx + 2] };
+  };
+
+  // FRLG summary screen panel frame — calibrated from real screenshots:
+  // Normal:  panel header = purple hsl(270°, 23%, 58%) — rgb(148,123,173)
+  // Shiny:   panel header = teal  hsl(177°, 74%, 65%) — rgb(98,232,225)
+  //
+  // Best detection points are the panel header/frame pixels which always
+  // show the colored border regardless of which Pokemon is displayed
+  const borderPoints = [
+    { x: 10, y: 20 },   // panel header left (most reliable)
+    { x: 75, y: 20 },   // panel header right (most reliable)
+    { x: 10, y: 30 },   // below header (may overlap sprite area)
+    { x: 40, y: 17 },   // mid header
+    { x: 60, y: 17 },   // mid-right header
+  ];
+
+  let tealPixels = 0;
+  let purplePixels = 0;
+  let sampled = 0;
+
+  for (const pt of borderPoints) {
+    const p = getPixel(pt.x, pt.y);
+    const hsl = rgbToHsl(p.r, p.g, p.b);
+
+    // Skip achromatic pixels (gray/white/black) — need some saturation
+    if (hsl.s < 0.10 || hsl.l < 0.2 || hsl.l > 0.9) continue;
+    sampled++;
+
+    // Teal/cyan: hue 160-200°, sat > 0.2 (shiny border is very saturated ~70%)
+    if (hsl.h >= 150 && hsl.h <= 210 && hsl.s > 0.2) tealPixels++;
+    // Purple/lavender: hue 240-320° (normal border is ~270° with ~23% sat)
+    if (hsl.h >= 240 && hsl.h <= 320 && hsl.s > 0.10) purplePixels++;
+  }
+
+  // Shiny if more teal than purple in the border
+  const isShiny = tealPixels > purplePixels && tealPixels >= 2;
+  const total = tealPixels + purplePixels;
+  const confidence = total > 0 ? Math.abs(tealPixels - purplePixels) / total : 0;
+
+  return { isShiny, confidence, tealPixels, purplePixels, borderPixelsSampled: sampled };
+}
+
+function isSummaryScreenFromRaw(data: Buffer, info: RawImageInfo): boolean {
+  const getPixel = (px: number, py: number) => {
+    const cx = Math.min(px, info.width - 1);
+    const cy = Math.min(py, info.height - 1);
+    const idx = (cy * info.width + cx) * info.channels;
+    return { r: data[idx], g: data[idx + 1], b: data[idx + 2] };
+  };
+
+  // Check 1: Teal page indicator near top center (120, 5) — present for both normal and shiny
+  const pageIndicator = getPixel(120, 5);
+  const piHsl = rgbToHsl(pageIndicator.r, pageIndicator.g, pageIndicator.b);
+  const hasTealIndicator = piHsl.h >= 160 && piHsl.h <= 200 && piHsl.s > 0.2;
+
+  // Check 2: Right side should be light (cream/white), not dark
+  const rightPoints = [
+    getPixel(200, 60),
+    getPixel(220, 80),
+    getPixel(200, 100),
+  ];
+  let lightCount = 0;
+  let brightYellowCount = 0;
+  for (const p of rightPoints) {
+    if (p.r > 180 && p.g > 160 && p.b > 130) lightCount++;
+    if (p.r > 200 && p.g > 180 && p.b < 100) brightYellowCount++;
+  }
+
+  // Reject naming screen (bright yellow background)
+  if (brightYellowCount >= 2) return false;
+
+  // Summary confirmed if: teal page indicator + light right side
+  if (hasTealIndicator && lightCount >= 2) return true;
+
+  // Fallback: colored UI element (purple or teal) at top-left + light right side
+  const topLeftUi = getPixel(10, 30);
+  const tlHsl = rgbToHsl(topLeftUi.r, topLeftUi.g, topLeftUi.b);
+  const hasColoredUi = tlHsl.s > 0.15 && tlHsl.l > 0.3 && tlHsl.l < 0.8;
+
+  return hasColoredUi && lightCount >= 2;
+}
+
+interface SpriteAnalysis {
+  normalPixels: number;
+  shinyPixels: number;
+  totalSampled: number;
+}
+
+function analyzeRegionFromRaw(
+  data: Buffer,
+  info: RawImageInfo,
   region: SpriteRegion,
   palette: { normal: ColorSignature; shiny: ColorSignature }
-): Promise<DetectionResult> {
-  // Get image dimensions to validate region
-  const metadata = await sharp(frameBuffer).metadata();
-  const imgWidth = metadata.width || 240;
-  const imgHeight = metadata.height || 160;
-
-  // Clamp region to image bounds
-  const x = Math.min(region.x, imgWidth - 1);
-  const y = Math.min(region.y, imgHeight - 1);
-  const w = Math.min(region.width, imgWidth - x);
-  const h = Math.min(region.height, imgHeight - y);
-
-  // Extract the sprite region's raw pixel data
-  const { data } = await sharp(frameBuffer)
-    .extract({ left: x, top: y, width: w, height: h })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+): SpriteAnalysis {
+  const x = Math.min(region.x, info.width - 1);
+  const y = Math.min(region.y, info.height - 1);
+  const w = Math.min(region.width, info.width - x);
+  const h = Math.min(region.height, info.height - y);
 
   let normalPixels = 0;
   let shinyPixels = 0;
   let totalSampled = 0;
 
-  // Analyze every pixel in the region
-  for (let i = 0; i < data.length; i += 3) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
+  for (let py = y; py < y + h; py++) {
+    for (let px = x; px < x + w; px++) {
+      const idx = (py * info.width + px) * info.channels;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const hsl = rgbToHsl(r, g, b);
 
-    const { h, s, l } = rgbToHsl(r, g, b);
+      if (hsl.l < 0.15 || hsl.l > 0.9 || hsl.s < 0.15) continue;
+      totalSampled++;
 
-    // Skip near-black, near-white, and low-saturation pixels (background/outlines)
-    if (l < 0.15 || l > 0.9 || s < 0.15) continue;
-
-    totalSampled++;
-
-    if (matchesSignature(h, s, l, palette.normal)) {
-      normalPixels++;
-    }
-    if (matchesSignature(h, s, l, palette.shiny)) {
-      shinyPixels++;
+      if (matchesSignature(hsl.h, hsl.s, hsl.l, palette.normal)) normalPixels++;
+      if (matchesSignature(hsl.h, hsl.s, hsl.l, palette.shiny)) shinyPixels++;
     }
   }
 
-  // Determine if shiny based on pixel ratios
-  const isShiny = shinyPixels > normalPixels && shinyPixels > totalSampled * 0.1;
-  const confidence = totalSampled > 0
-    ? Math.abs(shinyPixels - normalPixels) / totalSampled
-    : 0;
-
-  const result: DetectionResult = {
-    isShiny,
-    confidence,
-    normalPixels,
-    shinyPixels,
-    totalSampled,
-    debugInfo: `normal=${normalPixels} shiny=${shinyPixels} total=${totalSampled} ratio=${totalSampled > 0 ? (shinyPixels / totalSampled * 100).toFixed(1) : 0}%`,
-  };
-
-  logger.debug(
-    `Detection: ${result.isShiny ? 'SHINY!' : 'normal'} — ${result.debugInfo}`
-  );
-
-  return result;
+  return { normalPixels, shinyPixels, totalSampled };
 }
