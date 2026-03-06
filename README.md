@@ -115,7 +115,9 @@ HUNT_TYPE=wild
 - **Nidoran M**: Route 3, Route 22, Safari Zone
 - **Nidoran F**: Route 3, Route 22, Safari Zone
 
-**Flow:** Walk up/down/left/right in a cycle → detect battle screen → wait for Pokemon entry animation → scan 8 frames for sparkle clusters → if shiny: STOP (catch it manually!) → if not: run from battle → continue walking.
+**Flow:** Walk up/down in a cycle → detect battle screen → wait for "Wild X appeared!" text → OCR species name from text box → burst capture 8 frames → sparkle cluster detection + palette-based shiny verification → if shiny: STOP (catch it manually!) → if not: run from battle → continue walking.
+
+The wild hunt identifies species via Tesseract OCR on the battle text box (white text on dark blue — very reliable), then cross-references the sprite's hue distribution against that species' known normal/shiny palette for a second shiny check.
 
 When a shiny is found, the bot stops completely so you can catch it manually.
 
@@ -186,7 +188,19 @@ All endpoints are at `http://localhost:3002`.
 | Hunt Type | Detection Method |
 |-----------|-----------------|
 | **Starter / Static / Fossil / Casino** | Summary screen border color analysis — compares hue distribution against known normal/shiny palettes |
-| **Wild** | Battle sparkle detection — scans enemy Pokemon region for bright white/yellow pixel clusters during entry animation |
+| **Wild** | Dual detection: (1) sparkle cluster analysis — scans enemy sprite region for bright pixel clusters during entry animation, (2) palette comparison — with species identified via text box OCR, compares sprite hue distribution against that species' normal vs shiny palette signatures |
+
+### Wild Hunt Detection Pipeline
+
+1. **Battle detection** — `isBattleScreen()` checks for the dark text box at the bottom of the frame
+2. **Species OCR** — Waits 1.5s for "Wild X appeared!" text to render, then OCRs with Tesseract (grayscale → threshold 160 → 4x nearest upscale). Fuzzy matches to known Pokemon names via Levenshtein distance
+3. **Sparkle scan** — Burst captures 8 frames over 2s, analyzes each for small bright clusters (shiny = 3+ clusters with 30+ total pixels)
+4. **Palette check** — With known species, extracts hue distribution from enemy sprite region (background-filtered) and scores against that species' normal vs shiny palette
+5. **Decision** — Shiny if either sparkle OR palette detects it
+
+### Auto-Generated Palettes
+
+All 152 Gen 1 Pokemon palettes are auto-generated from PokeAPI sprite data via `scripts/extract-palettes.ts`. The script downloads FRLG sprites, extracts HSL hue distributions using 10-degree bin grouping, and writes `src/detection/generated-palettes.ts`.
 
 ## Project Structure
 
@@ -215,11 +229,12 @@ src/
   detection/
     shiny-detector.ts    # Summary screen shiny detection
     battle-shiny.ts      # Battle sparkle detection (wild hunts)
-    color-palettes.ts    # Normal/shiny hue signatures per Pokemon
+    battle-info.ts       # Battle text box OCR (species, level, gender)
+    battle-palette.ts    # Battle sprite palette analysis (shiny verification)
+    generated-palettes.ts # Auto-generated palettes for 152 FRLG Pokemon
+    color-palettes.ts    # Manual normal/shiny hue signatures
     stats-ocr.ts         # Pixel template matching for stat values
     summary-info.ts      # Summary screen OCR (nature, gender, TID)
-    screen-detector.ts   # Screen type classification
-    sprite-regions.ts    # Pokemon sprite bounding boxes
 
   drivers/
     switch-input.ts      # ESP32 serial → Switch USB HID
@@ -236,9 +251,12 @@ firmware/
   switch-controller/
     switch-controller.ino  # ESP32-S3 Arduino firmware (Pokken pad HID)
 
-data/                    # SQLite DB + calibration JSON (gitignored)
+scripts/
+  extract-palettes.ts    # Download FRLG sprites → generate palette signatures
+
+data/                    # SQLite DB, calibration, sprites (gitignored)
 screenshots/             # Encounter screenshots (gitignored)
-test/                    # Jest test suites
+test/                    # Jest test suites (5 suites, 63+ tests)
 ```
 
 ## Supported Pokemon
