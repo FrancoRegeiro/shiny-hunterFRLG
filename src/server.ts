@@ -317,8 +317,15 @@ const STATIC_DASHBOARD_HTML = `<!DOCTYPE html>
   .ago { color: #666; font-size: 10px; }
   .male { color: #6af; }
   .female { color: #f6a; }
+  .game-view { text-align: center; margin-bottom: 16px; }
+  .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
+  .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
 </style></head><body>
 <h1>Static Encounter Shiny Hunt</h1>
+<div class="game-view">
+  <img id="gameview" src="/api/frame" alt="Game View" onerror="this.style.opacity=0.3">
+  <div class="label">Live Game View</div>
+</div>
 <div class="stats" id="stats"></div>
 <div class="log-wrap"><table><thead><tr>
   <th>#</th><th>Time</th><th>Nature</th><th>Gender</th><th>Detection</th>
@@ -351,6 +358,10 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 3000);
+setInterval(function() {
+  var img = document.getElementById('gameview');
+  if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
+}, 100);
 </script></body></html>`;
 
 const WILD_DASHBOARD_HTML = `<!DOCTYPE html>
@@ -421,11 +432,11 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2000);
-// Auto-refresh game view at ~5fps
+// Auto-refresh game view at ~10fps (matches capture card)
 setInterval(function() {
   var img = document.getElementById('gameview');
   if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
-}, 200);
+}, 100);
 </script></body></html>`;
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
@@ -464,8 +475,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .delta-pos { color: #ff9966; }
   .delta-neg { color: #66ccff; }
   .delta-zero { color: #00ff88; }
+  .game-view { text-align: center; margin-bottom: 16px; }
+  .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
+  .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
 </style></head><body>
 <h1>Shiny Hunter - Multi-SID Targeting</h1>
+<div class="game-view">
+  <img id="gameview" src="/api/frame" alt="Game View" onerror="this.style.opacity=0.3">
+  <div class="label">Live Game View</div>
+</div>
 <div class="stats" id="stats"></div>
 <div class="legend">
   <span><span class="unique">&#9632;</span> Unique PID</span>
@@ -533,6 +551,10 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 5000);
+setInterval(function() {
+  var img = document.getElementById('gameview');
+  if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
+}, 100);
 </script></body></html>`;
 
 export function startServer(engine: IHuntEngine, frameSource?: FrameSource): void {
