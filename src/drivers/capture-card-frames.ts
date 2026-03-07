@@ -21,6 +21,7 @@ export class CaptureCardFrames implements FrameSource {
   private latestFrame: Buffer | null = null;
   private latestFrameTime = 0;
   private running = false;
+  private dashboardPollTimer: ReturnType<typeof setInterval> | null = null;
 
   async init(): Promise<void> {
     this.device = config.switch.captureDevice;
@@ -44,6 +45,21 @@ export class CaptureCardFrames implements FrameSource {
       logger.warn('[Capture] WARNING: Test frame does not look like a GBA game. Check CAPTURE_DEVICE.');
     }
     logger.info('Capture card test frame OK');
+
+    // Background poll: keep dashboard frame cache fresh even when engine isn't capturing
+    this.dashboardPollTimer = setInterval(async () => {
+      try {
+        const raw = await fs.readFile(this.tmpPath);
+        if (raw.length < 500) return;
+        const buffer = await sharp(raw)
+          .trim({ threshold: 20 })
+          .resize(240, 160, { fit: 'fill' })
+          .png()
+          .toBuffer();
+        this.latestFrame = buffer;
+        this.latestFrameTime = Date.now();
+      } catch {}
+    }, 100);
   }
 
   private async startContinuousCapture(): Promise<void> {
@@ -164,6 +180,10 @@ export class CaptureCardFrames implements FrameSource {
 
   async cleanup(): Promise<void> {
     this.running = false;
+    if (this.dashboardPollTimer) {
+      clearInterval(this.dashboardPollTimer);
+      this.dashboardPollTimer = null;
+    }
     if (this.ffmpegProcess) {
       this.ffmpegProcess.kill('SIGTERM');
       await new Promise(r => setTimeout(r, 1000));
