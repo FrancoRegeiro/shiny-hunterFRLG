@@ -362,8 +362,8 @@ export class WildHuntEngine extends EventEmitter {
       `${framesChecked} frames`
     );
 
-    // Save debug screenshots for first 10 encounters
-    if (this.encounters <= 10 || bestResult.sparkleCount > 10 || paletteShiny) {
+    // Save debug screenshots only for potential shinies
+    if (bestResult.sparkleCount > 25 || paletteShiny) {
       try {
         const debugFrame = battleFrame || (burstFrames.length > 0 ? burstFrames[burstFrames.length - 1] : await this.frameSource.captureFrame());
         const debugPath = path.join(
@@ -459,7 +459,11 @@ export class WildHuntEngine extends EventEmitter {
       await this.wait(400);
     }
 
-    // If running failed ("Can't escape!"), WAIT_OVERWORLD detects and retries.
+    // Wait for battle-exit transition to finish before checking overworld.
+    // Without this, the fading screen still has the dark text box region,
+    // causing isBattleScreen() to return true → false "still in battle" retry.
+    await this.wait(1500);
+
     this.state = 'WAIT_OVERWORLD';
   }
 
