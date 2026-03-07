@@ -1,5 +1,4 @@
 import express from 'express';
-import { spawn, ChildProcess } from 'child_process';
 import { config } from './config';
 import { logger } from './logger';
 import { IHuntEngine, FrameSource } from './types';
@@ -39,32 +38,6 @@ export function createServer(engine: IHuntEngine, frameSource?: FrameSource): ex
       }
     });
   }
-
-  // Audio stream from capture card — serves raw PCM s16le for Web Audio API
-  app.get('/api/audio', (req, res) => {
-    const audioDevice = process.env.CAPTURE_AUDIO_DEVICE || 'MiraBox Audio Capture';
-    const ffmpeg = spawn('ffmpeg', [
-      '-probesize', '32',
-      '-analyzeduration', '0',
-      '-fflags', '+nobuffer+flush_packets',
-      '-f', 'avfoundation',
-      '-i', `:${audioDevice}`,
-      '-ac', '1',
-      '-ar', '48000',
-      '-f', 's16le',
-      'pipe:1',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.flushHeaders();
-
-    ffmpeg.stdout.pipe(res);
-    ffmpeg.stderr?.on('data', () => {});
-
-    req.on('close', () => { ffmpeg.kill('SIGTERM'); });
-    ffmpeg.on('error', () => { if (!res.headersSent) res.status(500).end(); });
-  });
 
   // Current hunt status
   app.get('/api/status', (_req, res) => {
@@ -347,22 +320,11 @@ const STATIC_DASHBOARD_HTML = `<!DOCTYPE html>
   .game-view { text-align: center; margin-bottom: 16px; }
   .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
   .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
-  .audio-ctrl { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 8px; }
-  .audio-ctrl button { background: #16213e; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
-  .audio-ctrl button:hover { background: #1e3a5f; }
-  .audio-ctrl button.active { background: #2a5a2a; border-color: #4a4; }
-  .audio-ctrl input[type=range] { width: 120px; accent-color: #ffd700; }
-  .audio-ctrl .vol-label { font-size: 11px; color: #888; min-width: 32px; }
 </style></head><body>
 <h1>Static Encounter Shiny Hunt</h1>
 <div class="game-view">
   <img id="gameview" src="/api/frame" alt="Game View" onerror="this.style.opacity=0.3">
   <div class="label">Live Game View</div>
-  <div class="audio-ctrl">
-    <button id="audioToggle" onclick="toggleAudio()">Sound: OFF</button>
-    <input type="range" id="volume" min="0" max="100" value="50" oninput="setVolume(this.value)">
-    <span class="vol-label" id="volLabel">50%</span>
-  </div>
 </div>
 <div class="stats" id="stats"></div>
 <div class="log-wrap"><table><thead><tr>
@@ -400,58 +362,6 @@ setInterval(function() {
   var img = document.getElementById('gameview');
   if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
 }, 100);
-var audioCtx = null, gainNode = null, audioReader = null, audioPlaying = false;
-function toggleAudio() {
-  var btn = document.getElementById('audioToggle');
-  if (audioPlaying) {
-    audioPlaying = false;
-    if (audioReader) { audioReader.cancel(); audioReader = null; }
-    if (audioCtx) { audioCtx.close(); audioCtx = null; gainNode = null; }
-    btn.textContent = 'Sound: OFF'; btn.classList.remove('active');
-  } else {
-    audioCtx = new AudioContext({ sampleRate: 48000 });
-    gainNode = audioCtx.createGain();
-    gainNode.gain.value = document.getElementById('volume').value / 100;
-    gainNode.connect(audioCtx.destination);
-    audioPlaying = true;
-    btn.textContent = 'Sound: ON'; btn.classList.add('active');
-    streamAudio();
-  }
-}
-async function streamAudio() {
-  try {
-    var resp = await fetch('/api/audio');
-    audioReader = resp.body.getReader();
-    var nextTime = audioCtx.currentTime + 0.1;
-    var leftover = new Uint8Array(0);
-    while (audioPlaying) {
-      var result = await audioReader.read();
-      if (result.done) break;
-      var combined = new Uint8Array(leftover.length + result.value.length);
-      combined.set(leftover); combined.set(result.value, leftover.length);
-      var samples = Math.floor(combined.length / 2);
-      var remainder = combined.length - samples * 2;
-      leftover = remainder > 0 ? combined.slice(combined.length - remainder) : new Uint8Array(0);
-      var buf = audioCtx.createBuffer(1, samples, 48000);
-      var channel = buf.getChannelData(0);
-      for (var i = 0; i < samples; i++) {
-        var val = combined[i*2] | (combined[i*2+1] << 8);
-        if (val >= 32768) val -= 65536;
-        channel[i] = val / 32768;
-      }
-      var src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(gainNode);
-      if (nextTime < audioCtx.currentTime) nextTime = audioCtx.currentTime;
-      src.start(nextTime);
-      nextTime += buf.duration;
-    }
-  } catch(e) { if (audioPlaying) console.error('Audio stream error:', e); }
-}
-function setVolume(v) {
-  if (gainNode) gainNode.gain.value = v / 100;
-  document.getElementById('volLabel').textContent = v + '%';
-}
 </script></body></html>`;
 
 const WILD_DASHBOARD_HTML = `<!DOCTYPE html>
@@ -478,22 +388,11 @@ const WILD_DASHBOARD_HTML = `<!DOCTYPE html>
   .game-view { text-align: center; margin-bottom: 16px; }
   .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
   .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
-  .audio-ctrl { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 8px; }
-  .audio-ctrl button { background: #16213e; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
-  .audio-ctrl button:hover { background: #1e3a5f; }
-  .audio-ctrl button.active { background: #2a5a2a; border-color: #4a4; }
-  .audio-ctrl input[type=range] { width: 120px; accent-color: #ffd700; }
-  .audio-ctrl .vol-label { font-size: 11px; color: #888; min-width: 32px; }
 </style></head><body>
 <h1>Wild Encounter Shiny Hunt — <span id="target" style="color:#ffd700"></span></h1>
 <div class="game-view">
   <img id="gameview" src="/api/frame" alt="Game View" onerror="this.style.opacity=0.3">
   <div class="label">Live Game View</div>
-  <div class="audio-ctrl">
-    <button id="audioToggle" onclick="toggleAudio()">Sound: OFF</button>
-    <input type="range" id="volume" min="0" max="100" value="50" oninput="setVolume(this.value)">
-    <span class="vol-label" id="volLabel">50%</span>
-  </div>
 </div>
 <div class="stats" id="stats"></div>
 <div class="log-wrap"><table><thead><tr>
@@ -538,58 +437,6 @@ setInterval(function() {
   var img = document.getElementById('gameview');
   if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
 }, 100);
-var audioCtx = null, gainNode = null, audioReader = null, audioPlaying = false;
-function toggleAudio() {
-  var btn = document.getElementById('audioToggle');
-  if (audioPlaying) {
-    audioPlaying = false;
-    if (audioReader) { audioReader.cancel(); audioReader = null; }
-    if (audioCtx) { audioCtx.close(); audioCtx = null; gainNode = null; }
-    btn.textContent = 'Sound: OFF'; btn.classList.remove('active');
-  } else {
-    audioCtx = new AudioContext({ sampleRate: 48000 });
-    gainNode = audioCtx.createGain();
-    gainNode.gain.value = document.getElementById('volume').value / 100;
-    gainNode.connect(audioCtx.destination);
-    audioPlaying = true;
-    btn.textContent = 'Sound: ON'; btn.classList.add('active');
-    streamAudio();
-  }
-}
-async function streamAudio() {
-  try {
-    var resp = await fetch('/api/audio');
-    audioReader = resp.body.getReader();
-    var nextTime = audioCtx.currentTime + 0.1;
-    var leftover = new Uint8Array(0);
-    while (audioPlaying) {
-      var result = await audioReader.read();
-      if (result.done) break;
-      var combined = new Uint8Array(leftover.length + result.value.length);
-      combined.set(leftover); combined.set(result.value, leftover.length);
-      var samples = Math.floor(combined.length / 2);
-      var remainder = combined.length - samples * 2;
-      leftover = remainder > 0 ? combined.slice(combined.length - remainder) : new Uint8Array(0);
-      var buf = audioCtx.createBuffer(1, samples, 48000);
-      var channel = buf.getChannelData(0);
-      for (var i = 0; i < samples; i++) {
-        var val = combined[i*2] | (combined[i*2+1] << 8);
-        if (val >= 32768) val -= 65536;
-        channel[i] = val / 32768;
-      }
-      var src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(gainNode);
-      if (nextTime < audioCtx.currentTime) nextTime = audioCtx.currentTime;
-      src.start(nextTime);
-      nextTime += buf.duration;
-    }
-  } catch(e) { if (audioPlaying) console.error('Audio stream error:', e); }
-}
-function setVolume(v) {
-  if (gainNode) gainNode.gain.value = v / 100;
-  document.getElementById('volLabel').textContent = v + '%';
-}
 </script></body></html>`;
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
@@ -631,22 +478,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .game-view { text-align: center; margin-bottom: 16px; }
   .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
   .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
-  .audio-ctrl { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 8px; }
-  .audio-ctrl button { background: #16213e; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
-  .audio-ctrl button:hover { background: #1e3a5f; }
-  .audio-ctrl button.active { background: #2a5a2a; border-color: #4a4; }
-  .audio-ctrl input[type=range] { width: 120px; accent-color: #ffd700; }
-  .audio-ctrl .vol-label { font-size: 11px; color: #888; min-width: 32px; }
 </style></head><body>
 <h1>Shiny Hunter - Multi-SID Targeting</h1>
 <div class="game-view">
   <img id="gameview" src="/api/frame" alt="Game View" onerror="this.style.opacity=0.3">
   <div class="label">Live Game View</div>
-  <div class="audio-ctrl">
-    <button id="audioToggle" onclick="toggleAudio()">Sound: OFF</button>
-    <input type="range" id="volume" min="0" max="100" value="50" oninput="setVolume(this.value)">
-    <span class="vol-label" id="volLabel">50%</span>
-  </div>
 </div>
 <div class="stats" id="stats"></div>
 <div class="legend">
@@ -719,58 +555,6 @@ setInterval(function() {
   var img = document.getElementById('gameview');
   if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
 }, 100);
-var audioCtx = null, gainNode = null, audioReader = null, audioPlaying = false;
-function toggleAudio() {
-  var btn = document.getElementById('audioToggle');
-  if (audioPlaying) {
-    audioPlaying = false;
-    if (audioReader) { audioReader.cancel(); audioReader = null; }
-    if (audioCtx) { audioCtx.close(); audioCtx = null; gainNode = null; }
-    btn.textContent = 'Sound: OFF'; btn.classList.remove('active');
-  } else {
-    audioCtx = new AudioContext({ sampleRate: 48000 });
-    gainNode = audioCtx.createGain();
-    gainNode.gain.value = document.getElementById('volume').value / 100;
-    gainNode.connect(audioCtx.destination);
-    audioPlaying = true;
-    btn.textContent = 'Sound: ON'; btn.classList.add('active');
-    streamAudio();
-  }
-}
-async function streamAudio() {
-  try {
-    var resp = await fetch('/api/audio');
-    audioReader = resp.body.getReader();
-    var nextTime = audioCtx.currentTime + 0.1;
-    var leftover = new Uint8Array(0);
-    while (audioPlaying) {
-      var result = await audioReader.read();
-      if (result.done) break;
-      var combined = new Uint8Array(leftover.length + result.value.length);
-      combined.set(leftover); combined.set(result.value, leftover.length);
-      var samples = Math.floor(combined.length / 2);
-      var remainder = combined.length - samples * 2;
-      leftover = remainder > 0 ? combined.slice(combined.length - remainder) : new Uint8Array(0);
-      var buf = audioCtx.createBuffer(1, samples, 48000);
-      var channel = buf.getChannelData(0);
-      for (var i = 0; i < samples; i++) {
-        var val = combined[i*2] | (combined[i*2+1] << 8);
-        if (val >= 32768) val -= 65536;
-        channel[i] = val / 32768;
-      }
-      var src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(gainNode);
-      if (nextTime < audioCtx.currentTime) nextTime = audioCtx.currentTime;
-      src.start(nextTime);
-      nextTime += buf.duration;
-    }
-  } catch(e) { if (audioPlaying) console.error('Audio stream error:', e); }
-}
-function setVolume(v) {
-  if (gainNode) gainNode.gain.value = v / 100;
-  document.getElementById('volLabel').textContent = v + '%';
-}
 </script></body></html>`;
 
 export function startServer(engine: IHuntEngine, frameSource?: FrameSource): void {
