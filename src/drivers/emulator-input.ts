@@ -179,7 +179,7 @@ export class EmulatorInput implements InputController {
     const line = `${timestamp} [${level}] [ENCOUNTER] ${msg}${detailStr}\n`;
     const fs = require('fs');
     try {
-      fs.appendFileSync('./logs/lua-bridge.log', line);
+      fs.appendFileSync(require('path').join(process.cwd(), 'logs', 'lua-bridge.log'), line);
     } catch { /* ignore */ }
   }
 

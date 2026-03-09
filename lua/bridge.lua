@@ -2,7 +2,7 @@
 -- Load this script in mGBA: Tools → Scripting → Load Script
 
 local PORT = 8888
-local LOG_PATH = "./logs/lua-bridge.log"
+local LOG_PATH = "logs/lua-bridge.log"
 local server = nil
 local client = nil
 local buffer = ""
