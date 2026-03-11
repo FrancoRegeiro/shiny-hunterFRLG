@@ -383,8 +383,11 @@ const WILD_DASHBOARD_HTML = `<!DOCTYPE html>
   .shiny { background: #3d2e00 !important; color: #ffd700; }
   .log-wrap { max-height: 60vh; overflow-y: auto; }
   .ago { color: #666; font-size: 10px; }
-  .sparkle-high { color: #ffd700; font-weight: bold; }
-  .sparkle-low { color: #666; }
+  .timing-slow { color: #ff6b6b; font-weight: bold; }
+  .timing-normal { color: #666; }
+  .timing-cal { color: #555; font-style: italic; }
+  .signal { color: #00ff88; font-weight: bold; }
+  .signal-none { color: #333; }
   .game-view { text-align: center; margin-bottom: 16px; }
   .game-view img { width: 720px; height: 480px; image-rendering: pixelated; border: 2px solid #333; border-radius: 8px; background: #000; }
   .game-view .label { font-size: 11px; color: #666; margin-top: 4px; }
@@ -396,7 +399,7 @@ const WILD_DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 <div class="stats" id="stats"></div>
 <div class="log-wrap"><table><thead><tr>
-  <th>#</th><th>Time</th><th>Pokemon</th><th>Lv</th><th>Gender</th><th>Sparkles</th><th>Palette</th><th>Frames</th>
+  <th>#</th><th>Time</th><th>Pokemon</th><th>Lv</th><th>Gender</th><th>Delay</th><th>Signal</th>
 </tr></thead><tbody id="log"></tbody></table></div>
 <script>
 function ago(ts) {
@@ -424,19 +427,19 @@ async function refresh() {
       const lv = e.level != null ? e.level : '?';
       const gender = e.gender === 'male' ? '<span style="color:#6af">&#9794;</span>'
         : e.gender === 'female' ? '<span style="color:#f6a">&#9792;</span>' : '-';
-      const sc = e.sparkleCount > 20 ? 'sparkle-high' : 'sparkle-low';
-      const palette = e.paletteInfo || '-';
-      return '<tr class="'+cls+'"><td>'+e.attempt+'</td><td><span class="ago">'+ago(e.time)+'</span></td><td>'+species+'</td><td>'+lv+'</td><td>'+gender+'</td><td><span class="'+sc+'">'+e.sparkleCount+'</span></td><td>'+palette+'</td><td>'+e.framesChecked+'</td></tr>';
+      const delay = e.textDelayMs ? '<span class="'+(e.textDelayMs > 2500 ? 'timing-slow' : 'timing-normal')+'">'+e.textDelayMs+'ms</span>' : '<span class="timing-cal">-</span>';
+      const sigs = e.signals ? '<span class="signal">'+e.signals+'</span>' : '<span class="signal-none">-</span>';
+      return '<tr class="'+cls+'"><td>'+e.attempt+'</td><td><span class="ago">'+ago(e.time)+'</span></td><td>'+species+'</td><td>'+lv+'</td><td>'+gender+'</td><td>'+delay+'</td><td>'+sigs+'</td></tr>';
     }).join('');
   } catch(e) { console.error(e); }
 }
 refresh();
 setInterval(refresh, 2000);
-// Auto-refresh game view at ~10fps (matches capture card)
+// Auto-refresh game view at ~2fps (enough for monitoring, reduces CPU load)
 setInterval(function() {
   var img = document.getElementById('gameview');
   if (img) { img.src = '/api/frame?t=' + Date.now(); img.style.opacity = 1; }
-}, 100);
+}, 500);
 </script></body></html>`;
 
 const DASHBOARD_HTML = `<!DOCTYPE html>

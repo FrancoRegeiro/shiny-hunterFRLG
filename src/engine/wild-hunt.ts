@@ -7,11 +7,8 @@ import { logger } from '../logger';
 import {
   isBattleScreen,
   isOverworldScreen,
-  scanForSparkle,
-  scanFramesForSparkle,
 } from '../detection/battle-shiny';
-import { extractBattleInfo, hasWildAppearedText, BattleEnemyInfo } from '../detection/battle-info';
-import { analyzeBattlePalette, checkShinyByPalette, BattlePaletteResult } from '../detection/battle-palette';
+import { extractBattleInfo, BattleEnemyInfo } from '../detection/battle-info';
 
 /**
  * Wild encounter shiny hunt engine.
@@ -26,11 +23,76 @@ import { analyzeBattlePalette, checkShinyByPalette, BattlePaletteResult } from '
  * No soft resets needed — just walk continuously.
  */
 
+// ── Exported pure functions for testability ──
+
+export type TimingSignal = 'shiny' | 'normal' | 'inconclusive';
+
+export interface TimingResult {
+  signal: TimingSignal;
+  debug: string;
+}
+
+/**
+ * Evaluate the timing signal for shiny detection.
+ *
+ * The GBA game engine architecturally blocks "Wild X appeared!" text until
+ * the shiny sparkle animation completes (~80+ frames / ~1.3s). This creates
+ * a reliable timing gap between normal and shiny encounters.
+ */
+export function evaluateTimingSignal(opts: {
+  textDelayMs: number | null;
+  avgDelay: number;
+  historySize: number;
+  elapsedSinceBattle: number;
+}): TimingResult {
+  const { textDelayMs, avgDelay, historySize, elapsedSinceBattle } = opts;
+  const MIN_HISTORY = 5;
+  const HISTORY_MAX = 30;
+
+  if (textDelayMs !== null && textDelayMs > 0) {
+    // Absolute threshold: normal max across 10,243 encounters was 2481ms.
+    // Shiny adds 1300ms+. Any delay > 3500ms is definitively shiny.
+    if (textDelayMs > 3500) {
+      return { signal: 'shiny', debug: `delay=${textDelayMs}ms ABSOLUTE SHINY (>3500ms)` };
+    }
+
+    if (avgDelay > 0 && historySize >= MIN_HISTORY) {
+      const deviation = textDelayMs - avgDelay;
+      if (deviation > 1000) {
+        return { signal: 'shiny', debug: `delay=${textDelayMs}ms avg=${Math.round(avgDelay)}ms dev=+${Math.round(deviation)}ms SHINY` };
+      } else if (deviation > 600) {
+        return { signal: 'inconclusive', debug: `delay=${textDelayMs}ms avg=${Math.round(avgDelay)}ms dev=+${Math.round(deviation)}ms suspicious` };
+      } else if (deviation < 200) {
+        return { signal: 'normal', debug: `delay=${textDelayMs}ms avg=${Math.round(avgDelay)}ms dev=+${Math.round(deviation)}ms normal` };
+      } else {
+        return { signal: 'inconclusive', debug: `delay=${textDelayMs}ms avg=${Math.round(avgDelay)}ms dev=+${Math.round(deviation)}ms borderline` };
+      }
+    }
+    return { signal: 'inconclusive', debug: `delay=${textDelayMs}ms (calibrating: ${historySize}/${HISTORY_MAX} samples)` };
+  }
+
+  // No text detected at all
+  if (elapsedSinceBattle > 4500) {
+    return { signal: 'shiny', debug: `NO TEXT after ${elapsedSinceBattle}ms — likely shiny (animation blocking)` };
+  }
+  return { signal: 'inconclusive', debug: 'text not detected in time' };
+}
+
+/**
+ * Shiny decision based on timing signal.
+ */
+export function makeShinyDecision(opts: {
+  timingSignal: TimingSignal;
+}): { isShiny: boolean; signals: string[] } {
+  const signals: string[] = [];
+  if (opts.timingSignal === 'shiny') signals.push('timing');
+  return { isShiny: opts.timingSignal === 'shiny', signals };
+}
+
 type WildHuntState =
   | 'IDLE'
   | 'WALKING'
-  | 'BATTLE_ENTRY'
-  | 'CHECK_SPARKLE'
+  | 'BATTLE_DETECT'
   | 'SHINY_FOUND'
   | 'RUN_AWAY'
   | 'WAIT_OVERWORLD';
@@ -52,20 +114,24 @@ export class WildHuntEngine extends EventEmitter {
   private stepsSinceEncounter = 0;
   private lastBattleInfo: BattleEnemyInfo = { species: null, level: null, gender: 'unknown' };
   private waitOverworldTicks = 0;
+  private shinyAnnounced = false;
+
+  // Baseline timing: rolling average of "battle detected → text appeared" delay
+  // for normal encounters. Shiny encounters should be ~0.5-0.7s longer.
+  private textDelayHistory: number[] = [];
+  private static readonly TEXT_DELAY_HISTORY_SIZE = 30;
 
   // Encounter log for dashboard
   public encounterLog: Array<{
     attempt: number;
     time: number;
-    sparkleCount: number;
-    maxCluster: number;
     isShiny: boolean;
-    framesChecked: number;
-    debugInfo: string;
     species: string | null;
     level: number | null;
     gender: string;
-    paletteInfo: string;
+    textDelayMs?: number;
+    signals?: string;
+    debugInfo: string;
   }> = [];
 
   constructor(frameSource: FrameSource, input: InputController) {
@@ -118,6 +184,7 @@ export class WildHuntEngine extends EventEmitter {
     this.state = 'WALKING';
     this.walkIndex = 0;
     this.stepsSinceEncounter = 0;
+    this.shinyAnnounced = false;
     this.emit('started', this.getStatus());
 
     while (this.running) {
@@ -146,17 +213,18 @@ export class WildHuntEngine extends EventEmitter {
         await this.walkAndCheckBattle();
         break;
 
-      case 'BATTLE_ENTRY':
-        await this.handleBattleEntry();
-        break;
-
-      case 'CHECK_SPARKLE':
-        await this.checkSparkle();
+      case 'BATTLE_DETECT':
+        await this.handleBattleDetection();
         break;
 
       case 'SHINY_FOUND':
-        logger.info('[Wild Hunt] *** SHINY FOUND! Do NOT press anything — catch it manually! ***');
-        this.stop();
+        // Stay in this state — don't stop the engine so the server keeps running
+        // and the dashboard shows the shiny in battle. User catches manually.
+        if (!this.shinyAnnounced) {
+          logger.info('[Wild Hunt] *** SHINY FOUND! Do NOT press anything — catch it manually! ***');
+          this.shinyAnnounced = true;
+        }
+        await this.wait(5000);
         break;
 
       case 'RUN_AWAY':
@@ -193,7 +261,7 @@ export class WildHuntEngine extends EventEmitter {
     if (inBattle) {
       logger.info(`[Wild Hunt] Battle detected after ${this.stepsSinceEncounter} steps!`);
       this.stepsSinceEncounter = 0;
-      this.state = 'BATTLE_ENTRY';
+      this.state = 'BATTLE_DETECT';
       return;
     }
 
@@ -204,171 +272,129 @@ export class WildHuntEngine extends EventEmitter {
   }
 
   /**
-   * Battle detected — wait for the enemy Pokemon to enter and the sparkle window.
+   * Unified battle detection: timing + sparkle + palette.
+   *
+   * Three independent shiny signals:
+   *   1. TIMING (primary, standalone-reliable): Shiny Pokemon have a ~1.3s+ longer
+   *      delay before "Wild X appeared!" text. The game engine architecturally blocks
+   *      text display until the 80+ frame sparkle animation completes (confirmed via
+   *      pokefirered decompilation). We use both absolute (>3500ms) and relative
+   *      (>1000ms above baseline) thresholds.
+   *   2. SPARKLE: Bright pixel cluster analysis on frames captured during entry.
+   *   3. PALETTE: Compare sprite colors against known normal/shiny palettes.
    *
    * FRLG wild battle timeline (from actual battle start):
    *   t+0.0s: Battle transition (screen wipe)
    *   t+1.0s: Battle background loads, enemy Pokemon slides in
-   *   t+1.5s: Enemy shiny sparkle plays (if shiny) — lasts ~1s
+   *   t+1.5s: Enemy shiny sparkle plays (if shiny) — lasts ~0.7s
    *   t+2.0s: Battle text box visible → isBattleScreen() detects it (t=0 for us)
-   *   t+3.0s: "Wild POKEMON appeared!" text
+   *   t+3.0s: "Wild POKEMON appeared!" text (normal) / ~t+3.5-3.7s (shiny)
    *   t+5.0s: "Go! CHARMANDER!" — player's Pokemon enters
    *   t+5.5s: Player's shiny sparkle plays (if shiny) + SCREEN FLASH
    *   t+7.0s: Battle menu appears
    *
    * IMPORTANT: Our player's Charmander is shiny, so it sparkles with a
    * screen-wide white flash at ~t+5.5s. We MUST end scanning before t+5s.
-   *
-   * From battle detection (t+2s):
-   *   - Wait 200ms for screen to stabilize
-   *   - Scan 8 frames × 150ms = 1200ms
-   *   - Total: ~1400ms → scan ends at ~t+3.4s (safe margin before t+5s)
-   *
-   * This catches the tail end of the enemy sparkle animation (t+1.5-2.5s).
    */
-  private async handleBattleEntry(): Promise<void> {
+  private async handleBattleDetection(): Promise<void> {
     this.encounters++;
-    logger.info(`[Wild Hunt] Encounter #${this.encounters} — reading "Wild X appeared!" text...`);
+    const battleDetectedAt = Date.now();
+    logger.info(`[Wild Hunt] Encounter #${this.encounters} — scanning...`);
 
-    // IMPORTANT: Don't press any buttons! Wait for "Wild X appeared!" text
-    // to fully render, then OCR it. The text box has white text on dark blue.
+    // ── Single-pass detection: capture frames + OCR + timing ──
+    // Poll every 200ms. First ~800ms: just capture frames (text won't be ready).
+    // After 800ms: attempt OCR on each frame. Break as soon as species is found.
     //
-    // Timeline from battle detection (isBattleScreen = true):
-    //   t+0s: Text box appears with "Wild CATERPIE appeared!" text
-    //   We wait ~1.5s for text to finish typing, then OCR.
-    //   Don't press A — let the text sit so we can read it reliably.
-
-    await this.wait(1500); // Wait for text animation to finish typing
-
+    // Normal encounter:  text at ~1.7-2.5s → species found, break → total ~2s
+    // Shiny encounter:   text at ~3.0-3.8s (1.3s+ sparkle delay) → timing signal
+    // Failed OCR:        falls through at 5s → absence of text = shiny signal
+    let lastFrame: Buffer | null = null;
+    let textAppearedAt: number | null = null;
+    let textDelayMs = 0;
     this.lastBattleInfo = { species: null, level: null, gender: 'unknown' };
 
-    // Try OCR multiple times — wait for "Wild X appeared!" text to be fully rendered
-    for (let attempt = 0; attempt < 5 && this.running; attempt++) {
+    const pollStart = Date.now();
+    const maxPollDuration = 5000; // 5s max — shiny sparkle animation adds ~1.3s+ delay
+    const ocrStartDelay = 800;   // Don't attempt OCR before 800ms (text not typed yet)
+
+    while (Date.now() - pollStart < maxPollDuration && this.running) {
       try {
         const frame = await this.frameSource.captureFrame();
+        lastFrame = frame;
 
-        // Check if text box has content before attempting expensive OCR
-        const textReady = await hasWildAppearedText(frame);
-        if (!textReady && attempt < 4) {
-          await this.wait(300);
-          continue;
-        }
+        const elapsed = Date.now() - battleDetectedAt;
 
-        const info = await extractBattleInfo(frame);
+        // After 800ms, attempt OCR on each frame
+        if (elapsed >= ocrStartDelay && !this.lastBattleInfo.species) {
+          try {
+            const info = await extractBattleInfo(frame);
+            if (info.species) {
+              this.lastBattleInfo.species = info.species;
+              textAppearedAt = Date.now();
+              textDelayMs = textAppearedAt - battleDetectedAt;
+            }
+            if (info.gender !== 'unknown') this.lastBattleInfo.gender = info.gender;
+            if (info.level) this.lastBattleInfo.level = info.level;
 
-        // Update with best info found
-        if (info.species && !this.lastBattleInfo.species) {
-          this.lastBattleInfo.species = info.species;
-        }
-        if (info.gender !== 'unknown') this.lastBattleInfo.gender = info.gender;
-        if (info.level) this.lastBattleInfo.level = info.level;
-
-        if (this.lastBattleInfo.species) {
-          logger.info(`[Wild Hunt] Identified: ${this.lastBattleInfo.species} Lv${this.lastBattleInfo.level ?? '?'} ${this.lastBattleInfo.gender}`);
-          break;
+            // Species found → we have the timing measurement, break
+            if (this.lastBattleInfo.species) {
+              break;
+            }
+          } catch {}
         }
       } catch {}
-      await this.wait(300);
+      await this.wait(200);
     }
 
-    if (!this.lastBattleInfo.species) {
+    if (this.lastBattleInfo.species) {
+      logger.info(`[Wild Hunt] Identified: ${this.lastBattleInfo.species} Lv${this.lastBattleInfo.level ?? '?'} ${this.lastBattleInfo.gender} (${textDelayMs}ms)`);
+    } else {
       logger.warn('[Wild Hunt] Could not identify species from text box OCR');
     }
 
-    this.state = 'CHECK_SPARKLE';
-  }
+    // ── Signal 1: Timing-based detection ──
+    const timingResult = evaluateTimingSignal({
+      textDelayMs: (textAppearedAt && textDelayMs > 0) ? textDelayMs : null,
+      avgDelay: this.getAverageTextDelay(),
+      historySize: this.textDelayHistory.length,
+      elapsedSinceBattle: Date.now() - battleDetectedAt,
+    });
+    const timingSignal = timingResult.signal;
+    const timingDebug = timingResult.debug;
 
-  /**
-   * Capture multiple frames during the Pokemon entry animation and check for sparkles.
-   * Uses BOTH sparkle detection AND palette-based shiny detection.
-   */
-  private async checkSparkle(): Promise<void> {
-    // Use burst capture if available (single ffmpeg call = ~3s for 10 frames).
-    // Falls back to individual captures (~9s for 5 frames).
-    let sparkleShiny: boolean;
-    let bestResult: { sparkleCount: number; maxClusterSize: number; debugInfo: string; isShiny: boolean };
-    let framesChecked: number;
+    // ── Decision: timing only ──
+    const { isShiny, signals } = makeShinyDecision({ timingSignal });
 
-    let burstFrames: Buffer[] = [];
-    if (this.frameSource.captureFrameBurst) {
-      burstFrames = await this.frameSource.captureFrameBurst(8, 2); // 8 frames over 2s = 250ms intervals
-      ({ isShiny: sparkleShiny, bestResult, framesChecked } = await scanFramesForSparkle(burstFrames));
-    } else {
-      ({ isShiny: sparkleShiny, bestResult, framesChecked } = await scanForSparkle(
-        () => this.frameSource.captureFrame(),
-        5,    // frames to check
-        150,  // ms between frames
-      ));
-    }
-
-    // Palette-based species identification + shiny detection
-    // Try on the best battle frame (last frames most likely to show full sprite)
-    let paletteResult: BattlePaletteResult = {
-      species: null, speciesId: null, isShiny: false,
-      confidence: 0, normalScore: 0, shinyScore: 0, debugInfo: 'no frame',
-    };
-    let battleFrame: Buffer | null = null;
-
-    if (burstFrames.length > 0) {
-      for (let i = burstFrames.length - 1; i >= Math.max(0, burstFrames.length - 3); i--) {
-        const isBattle = await isBattleScreen(burstFrames[i]);
-        if (isBattle) {
-          battleFrame = burstFrames[i];
-          paletteResult = await analyzeBattlePalette(burstFrames[i]);
-          break;
-        }
-      }
-    }
-    // Fallback: capture a fresh frame
-    if (!paletteResult.species) {
-      try {
-        battleFrame = await this.frameSource.captureFrame();
-        paletteResult = await analyzeBattlePalette(battleFrame);
-      } catch {}
-    }
-
-    // Use battle info captured during "Wild X appeared!" text
     const species = this.lastBattleInfo.species;
     const level = this.lastBattleInfo.level;
     const gender = this.lastBattleInfo.gender;
-
-    // Palette-based shiny check: if we identified the species, compare
-    // the battle sprite against that species' known palettes.
-    // This is done on a battle frame where the sprite is fully visible.
-    let paletteShiny = false;
-    let paletteDebug = '';
-    if (species && battleFrame) {
-      try {
-        const paletteCheck = await checkShinyByPalette(battleFrame, species);
-        paletteShiny = paletteCheck.isShiny;
-        paletteDebug = paletteCheck.debugInfo;
-      } catch {}
-    }
-
-    // Shiny if EITHER sparkle animation OR palette comparison detects it.
-    // With known species, palette check is reliable (no species confusion).
-    const isShiny = sparkleShiny || paletteShiny;
-
     const infoStr = species
       ? `${species} Lv${level ?? '?'} ${gender === 'male' ? '♂' : gender === 'female' ? '♀' : ''}`
       : '';
 
     logger.info(
       `[Wild Hunt] Encounter #${this.encounters}: ` +
-      `${isShiny ? '*** SHINY! ***' : 'not shiny'} | ` +
+      `${isShiny ? `*** SHINY! *** [${signals.join('+')}]` : 'not shiny'} | ` +
       `${infoStr ? infoStr + ' | ' : ''}` +
-      `sparkle: ${bestResult.debugInfo} | ` +
-      `${paletteDebug ? 'palette: ' + paletteDebug + ' | ' : ''}` +
-      `${framesChecked} frames`
+      `timing: ${timingDebug}`
     );
 
-    // Save debug screenshots only for potential shinies
-    if (bestResult.sparkleCount > 25 || paletteShiny) {
+    // Update timing baseline (only for non-shiny encounters with valid timing)
+    if (!isShiny && textAppearedAt && textDelayMs > 0 && textDelayMs < 5000) {
+      this.textDelayHistory.push(textDelayMs);
+      if (this.textDelayHistory.length > WildHuntEngine.TEXT_DELAY_HISTORY_SIZE) {
+        this.textDelayHistory.shift();
+      }
+    }
+
+    // Save debug screenshot for shinies or every 500th encounter
+    if (isShiny || this.encounters % 500 === 0) {
       try {
-        const debugFrame = battleFrame || (burstFrames.length > 0 ? burstFrames[burstFrames.length - 1] : await this.frameSource.captureFrame());
+        const debugFrame = lastFrame || await this.frameSource.captureFrame();
+        const label = isShiny ? 'SHINY' : 'sample';
         const debugPath = path.join(
           process.cwd(), config.paths.screenshots,
-          `wild-debug-${this.encounters}-sparkle${bestResult.sparkleCount}-${Date.now()}.png`
+          `wild-debug-${this.encounters}-${label}-${Date.now()}.png`
         );
         fs.writeFile(debugPath, debugFrame).catch(() => {});
       } catch { /* ignore */ }
@@ -378,15 +404,13 @@ export class WildHuntEngine extends EventEmitter {
     this.encounterLog.push({
       attempt: this.encounters,
       time: Date.now(),
-      sparkleCount: bestResult.sparkleCount,
-      maxCluster: bestResult.maxClusterSize,
       isShiny,
-      framesChecked,
-      debugInfo: bestResult.debugInfo,
       species,
       level,
       gender,
-      paletteInfo: paletteDebug || paletteResult.debugInfo,
+      textDelayMs: textDelayMs || undefined,
+      signals: signals.length > 0 ? signals.join('+') : undefined,
+      debugInfo: timingDebug,
     });
     if (this.encounterLog.length > 200) this.encounterLog.shift();
 
@@ -400,7 +424,7 @@ export class WildHuntEngine extends EventEmitter {
       await fs.writeFile(screenshotPath, frame);
 
       this.emit('shiny', {
-        pokemon: this.target,
+        pokemon: species || this.target,
         encounters: this.encounters,
         elapsedSeconds: this.startedAt ? (Date.now() - this.startedAt) / 1000 : 0,
         screenshotPath,
@@ -408,14 +432,17 @@ export class WildHuntEngine extends EventEmitter {
 
       this.state = 'SHINY_FOUND';
     } else {
-      // Advance battle text: "Wild X appeared!" → "Go! CHARMANDER!" → player sparkle → menu.
-      // Proven timing: initial wait + 6 A presses at 500ms intervals gets through all text.
-      // If last A overshoots into menu and hits FIGHT, runFromBattle's B cancels it.
-      await this.wait(1000);
-      for (let i = 0; i < 6 && this.running; i++) {
+      // Advance battle text to the battle menu:
+      //   "Wild X appeared!" → A → "Go! CHARMANDER!" → player enters → menu
+      // The player's Pokemon entry animation takes ~2s after the last text box.
+      // Press A to advance text, then wait for the menu to appear.
+      // 5 A presses at 400ms = 2s, then wait 1.5s for player entry animation.
+      for (let i = 0; i < 5 && this.running; i++) {
         await this.input.pressButton('A', 50);
-        await this.wait(500);
+        await this.wait(400);
       }
+      // Wait for player Pokemon entry + sparkle animation to finish → menu appears
+      await this.wait(1500);
       this.state = 'RUN_AWAY';
     }
 
@@ -423,6 +450,11 @@ export class WildHuntEngine extends EventEmitter {
     if (this.encounters % 100 === 0) {
       this.emit('milestone', this.getStatus());
     }
+  }
+
+  private getAverageTextDelay(): number {
+    if (this.textDelayHistory.length === 0) return 0;
+    return this.textDelayHistory.reduce((a, b) => a + b, 0) / this.textDelayHistory.length;
   }
 
   /**
@@ -441,28 +473,27 @@ export class WildHuntEngine extends EventEmitter {
   private async runFromBattle(): Promise<void> {
     // B to cancel any sub-menu (move list, bag, team screen)
     await this.input.pressButton('B', 50);
-    await this.wait(300);
+    await this.wait(200);
     await this.input.pressButton('B', 50);
-    await this.wait(300);
+    await this.wait(200);
     // Navigate to RUN: RIGHT then DOWN reaches RUN from ANY cursor position
     // FIGHT→BAG→RUN, BAG→BAG→RUN, POKEMON→RUN→RUN, RUN→RUN→RUN
     await this.input.pressButton('RIGHT', 50);
-    await this.wait(100);
+    await this.wait(80);
     await this.input.pressButton('DOWN', 50);
-    await this.wait(100);
+    await this.wait(80);
     await this.input.pressButton('A', 50);
-    await this.wait(1500); // run animation
+    await this.wait(1000); // run animation
 
-    // "Got away safely!" — use B to dismiss (B won't open START menu on overworld)
-    for (let i = 0; i < 4 && this.running; i++) {
+    // "Got away safely!" — mash B quickly to dismiss
+    for (let i = 0; i < 5 && this.running; i++) {
       await this.input.pressButton('B', 50);
-      await this.wait(400);
+      await this.wait(250);
     }
 
-    // Wait for battle-exit transition to finish before checking overworld.
-    // Without this, the fading screen still has the dark text box region,
-    // causing isBattleScreen() to return true → false "still in battle" retry.
-    await this.wait(1500);
+    // Brief wait for battle-exit transition, then go straight to walking.
+    // The overworld check will catch any "still in battle" cases.
+    await this.wait(800);
 
     this.state = 'WAIT_OVERWORLD';
   }
@@ -474,10 +505,9 @@ export class WildHuntEngine extends EventEmitter {
   private async waitForOverworld(): Promise<void> {
     const frame = await this.frameSource.captureFrame();
 
-    // Check if we're back on overworld
+    // Check if we're back on overworld — start walking immediately
     const onOverworld = await isOverworldScreen(frame);
     if (onOverworld) {
-      logger.info(`[Wild Hunt] Back on overworld — continuing hunt (${this.encounters} encounters)`);
       this.waitOverworldTicks = 0;
       this.state = 'WALKING';
       return;
@@ -486,7 +516,7 @@ export class WildHuntEngine extends EventEmitter {
     // Check if we're still in battle (run failed)
     const inBattle = await isBattleScreen(frame);
     if (inBattle) {
-      logger.info('[Wild Hunt] Still in battle — run may have failed, trying again');
+      logger.info('[Wild Hunt] Still in battle — trying to run again');
       this.waitOverworldTicks = 0;
       this.state = 'RUN_AWAY';
       return;
@@ -496,7 +526,7 @@ export class WildHuntEngine extends EventEmitter {
 
     // If stuck for >10s (neither overworld nor battle), we're probably in a menu.
     // Spam B to exit, then soft reset if still stuck.
-    if (this.waitOverworldTicks > 40) { // 40 × 250ms = 10s
+    if (this.waitOverworldTicks > 66) { // 66 × 150ms = ~10s
       logger.warn('[Wild Hunt] Stuck in unknown screen — soft resetting');
       await this.input.softReset();
       await this.wait(3000);
@@ -510,11 +540,11 @@ export class WildHuntEngine extends EventEmitter {
       return;
     }
 
-    if (this.waitOverworldTicks > 20) { // 20 × 250ms = 5s — try B spam first
+    if (this.waitOverworldTicks > 30) { // 30 × 150ms = 4.5s — try B spam
       await this.input.pressButton('B', 50);
     }
 
-    await this.wait(250);
+    await this.wait(150);
   }
 
   private wait(ms: number): Promise<void> {

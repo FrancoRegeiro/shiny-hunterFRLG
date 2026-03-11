@@ -59,7 +59,7 @@ export class CaptureCardFrames implements FrameSource {
         this.latestFrame = buffer;
         this.latestFrameTime = Date.now();
       } catch {}
-    }, 100);
+    }, 500);
   }
 
   private async startContinuousCapture(): Promise<void> {
