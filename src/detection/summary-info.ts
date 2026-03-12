@@ -15,6 +15,43 @@ const NATURES = [
   'CALM', 'GENTLE', 'SASSY', 'CAREFUL', 'QUIRKY',
 ];
 
+const SPANISH_NATURE_TO_ENGLISH: Record<string, string> = {
+  // con acento
+  'HURAÑA': 'Lonely',
+  'PÍCARA': 'Naughty',
+  'DÓCIL': 'Docile',
+  'PLÁCIDA': 'Relaxed',
+  'PÍCARESCA': 'Quirky',
+
+  // sin acento (por si OCR las saca)
+  'HURANA': 'Lonely',
+  'PICARA': 'Naughty',
+  'DOCIL': 'Docile',
+  'PLACIDA': 'Relaxed',
+  'PICARESCA': 'Quirky',
+
+  'FUERTE': 'Hardy',
+  'AUDAZ': 'Brave',
+  'FIRME': 'Adamant',
+  'OSADA': 'Bold',
+  'AGITADA': 'Impish',
+  'FLOJA': 'Lax',
+  'MIEDOSA': 'Timid',
+  'ACTIVA': 'Hasty',
+  'SERIA': 'Serious',
+  'ALEGRE': 'Jolly',
+  'INGENUA': 'Naive',
+  'MODESTA': 'Modest',
+  'AFABLE': 'Mild',
+  'MANSA': 'Quiet',
+  'RARA': 'Bashful',
+  'ALOCA': 'Rash',
+  'SERENA': 'Calm',
+  'AMABLE': 'Gentle',
+  'GROSERA': 'Sassy',
+  'CAUTA': 'Careful',
+};
+
 // Valid nature names in title case (as returned by extractNature)
 const VALID_NATURES = new Set(NATURES.map(n => n.charAt(0) + n.slice(1).toLowerCase()));
 
@@ -130,7 +167,7 @@ async function getWorker(): Promise<Tesseract.Worker> {
   if (!worker) {
     worker = await Tesseract.createWorker('eng');
     await worker.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .',
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ .',
     });
   }
   return worker;
@@ -152,29 +189,53 @@ export async function extractNature(frameBuffer: Buffer): Promise<string | null>
     // Match against known natures
     const cleaned = text.toUpperCase().trim();
 
-    // Exact match first
+    // 1) Spanish -> English mapping first
+    for (const [spanishNature, englishNature] of Object.entries(SPANISH_NATURE_TO_ENGLISH)) {
+      if (cleaned.includes(spanishNature)) {
+        return englishNature;
+      }
+    }
+
+    // 2) Exact English match
     for (const nature of NATURES) {
       if (cleaned.includes(nature)) {
         return nature.charAt(0) + nature.slice(1).toLowerCase();
       }
     }
 
-    // Fuzzy match: extract word before "nature" and find closest
-    const beforeNature = cleaned.match(/(\w+)\s*NATURE/);
+    // Fuzzy match: extract word before "NATURE" or "NATURALEZA" and map to English
+    const beforeNature = cleaned.match(/(\w+)\s*(NATURE|NATURALEZA)/);
     if (beforeNature) {
       const candidate = beforeNature[1];
-      let bestMatch = '';
-      let bestDist = Infinity;
+      let bestEnglishMatch = '';
+      let bestEnglishDist = Infinity;
+
       for (const nature of NATURES) {
         const dist = levenshtein(candidate, nature);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestMatch = nature;
+        if (dist < bestEnglishDist) {
+          bestEnglishDist = dist;
+          bestEnglishMatch = nature;
         }
       }
-      // Accept if edit distance <= 2 (OCR drops/swaps 1-2 chars)
-      if (bestDist <= 2) {
-        return bestMatch.charAt(0) + bestMatch.slice(1).toLowerCase();
+
+      let bestSpanishMatch = '';
+      let bestSpanishDist = Infinity;
+
+      for (const spanishNature of Object.keys(SPANISH_NATURE_TO_ENGLISH)) {
+        const dist = levenshtein(candidate, spanishNature);
+        if (dist < bestSpanishDist) {
+          bestSpanishDist = dist;
+          bestSpanishMatch = spanishNature;
+        }
+      }
+
+      // Prefer the closest between English and Spanish
+      if (bestEnglishDist <= bestSpanishDist && bestEnglishDist <= 2) {
+        return bestEnglishMatch.charAt(0) + bestEnglishMatch.slice(1).toLowerCase();
+      }
+
+      if (bestSpanishDist < bestEnglishDist && bestSpanishDist <= 2) {
+        return SPANISH_NATURE_TO_ENGLISH[bestSpanishMatch];
       }
     }
 
@@ -207,7 +268,7 @@ export async function extractTID(frameBuffer: Buffer): Promise<number | null> {
     const { data: { text } } = await w.recognize(cropped);
     // Restore default parameters
     await w.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .',
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ .',
       tessedit_pageseg_mode: '3' as any,
     });
 
